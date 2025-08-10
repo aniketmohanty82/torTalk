@@ -1,0 +1,15 @@
+
+[identity]
+path = "node_identity.bin"   # where to store your local keypair
+
+[storage]
+path = "node_store.sqlite"    # local SQLite path
+
+[network]
+tcp_port = 45454              # TCP gossip listener
+
+[server]
+url = "http://127.0.0.1:8080" # central sync server base URL
+safety_mode = false           # set true to route server sync over Tor
+# tor_socks = "socks5h://127.0.0.1:9050"  # requires Tor running locally
+

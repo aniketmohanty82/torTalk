@@ -4,11 +4,11 @@ trying a tor based messaging app
 ## Install deps
 ### Python 3.11+
 #### macOS/Linux:
-- python -m venv .venv && source .venv/bin/activate
-- - pip install pynacl flask flask-cors requests tomli
+- ``` python -m venv .venv && source .venv/bin/activate ```
+- ``` pip install pynacl flask flask-cors requests tomli ```
 #### Windows (PowerShell):
-- py -m venv .venv; .venv\Scripts\Activate.ps1
-- pip install pynacl flask flask-cors requests tomli
+- ``` py -m venv .venv; .venv\Scripts\Activate.ps1 ```
+- ``` pip install pynacl flask flask-cors requests tomli ```
 
 ## 1) Start the central server
 In one terminal:
@@ -33,8 +33,8 @@ From Node A terminal:
 ## 6) Safety mode (Tor for server sync)
 - Install Tor locally and start the SOCKS proxy (default 9050).
 - In settings.toml, set:
-  - safety_mode = true
-  - tor_socks = "socks5h://127.0.0.1:9050"
+  - ``` safety_mode = true ```
+  - ``` tor_socks = "socks5h://127.0.0.1:9050" ```
 - Restart the node. Server sync now goes through Tor. LAN mesh continues to work locally.
 
 ## 7) Offline/Low connectivity behavior

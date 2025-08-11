@@ -1,96 +1,132 @@
 import argparse
 import asyncio
+import base64
 import json
+import os
+import requests
 import socket
 import struct
 import time
-from typing import Dict, List
-import base64
-
-import requests
 import tomllib
 
+from bootstrap import ensure_initialized
 from crypto_utils import Identity, load_or_create_identity, seal_for, open_sealed, sign, verify, msg_id
+from nacl.hash import blake2b
+from nacl.encoding import RawEncoder
 from store import Store
+from typing import Dict, Optional
 
-MULTICAST_GRP = '239.1.2.3'
+# ---------- helpers ----------
+
+def format_address(identity: Identity) -> str:
+    # mesh:<enc_b64>.<sig_b64>
+    return f"mesh:{identity.pub_b64}.{identity.sign_b64}"
+
+def _normalize_recipient(s: Optional[str]) -> Optional[str]:
+    """Allow --send-to to be either <enc_b64> or mesh:<enc>.<sig>."""
+    if not s:
+        return s
+    s = s.strip()
+    if s.startswith("mesh:"):
+        s = s.split("mesh:", 1)[1]
+    if "." in s:
+        s = s.split(".", 1)[0]
+    return s
+
+def _msg_id(sender_b64: str, recipient_b64: str, nonce: bytes) -> str:
+    return blake2b(
+        (sender_b64 + "|" + recipient_b64).encode() + nonce, encoder=RawEncoder
+    ).hex()
+
+
+# ---------- constants ----------
+
+MULTICAST_GRP = "239.1.2.3"
 MULTICAST_PORT = 54545
 GOSSIP_PORT_DEFAULT = 45454
 HELLO_INTERVAL = 5           # seconds
 GOSSIP_INTERVAL = 3          # seconds
 MESH_TTL_DEFAULT = 4         # max hops in LAN flood
 
+# ---------- node ----------
 
 class Node:
     def __init__(self, cfg_path: str):
-        with open(cfg_path, 'rb') as f:
+        with open(cfg_path, "rb") as f:
             cfg = tomllib.load(f)
-        self.identity: Identity = load_or_create_identity(cfg['identity']['path'])
-        self.store = Store(cfg['storage']['path'])
-        self.listen_port = cfg['network'].get('tcp_port', GOSSIP_PORT_DEFAULT)
-        self.server_url = cfg['server'].get('url')
-        self.tor_socks = cfg['server'].get('tor_socks')  # e.g., "socks5h://127.0.0.1:9050"
-        self.safety_mode = cfg['server'].get('safety_mode', False)
+
+        self.identity: Identity = load_or_create_identity(cfg["identity"]["path"])
+        self.store = Store(cfg["storage"]["path"])
+        self.listen_port = int(cfg["network"].get("tcp_port", GOSSIP_PORT_DEFAULT))
+        self.server_url = cfg["server"].get("url")
+        self.tor_socks = cfg["server"].get("tor_socks")  # e.g., "socks5h://127.0.0.1:9050"
+        self.safety_mode = bool(cfg["server"].get("safety_mode", False))
+
         self.session = requests.Session()
         if self.safety_mode and self.tor_socks:
-            self.session.proxies = {
-                'http': self.tor_socks,
-                'https': self.tor_socks,
-            }
+            self.session.proxies = {"http": self.tor_socks, "https": self.tor_socks}
 
     # ---- Message API ----
     def create_message(self, recipient_pub_b64: str, plaintext: str, ttl: int = MESH_TTL_DEFAULT) -> Dict:
-        ct = seal_for(recipient_pub_b64, plaintext.encode())
-        mid = msg_id(ct)
-        payload = (mid + recipient_pub_b64).encode()  # simple binding
-        sig = sign(self.identity, payload)
-        m = {
-            'id': mid,
-            'sender_pub': self.identity.pub_b64,
-            'sender_sig_pub': self.identity.sign_b64,
-            'recipient_pub': recipient_pub_b64,
-            'ciphertext': ct,
-            'signature': sig,
-            'ts': int(time.time()),
-            'ttl': ttl,
-            'delivered': 0,
-            'synced': 0,
-        }
-        self.store.upsert_message(m)
-        return m
+            nonce = os.urandom(16)  # NEW: per-message nonce
+            ct = seal_for(recipient_pub_b64, plaintext.encode())
+            mid = _msg_id(self.identity.pub_b64, recipient_pub_b64, nonce)  # NEW: stable id
+            payload = (mid + recipient_pub_b64).encode()  # unchanged binding for signature
+            sig = sign(self.identity, payload)
+            m = {
+                "id": mid,
+                "sender_pub": self.identity.pub_b64,
+                "sender_sig_pub": self.identity.sign_b64,
+                "recipient_pub": recipient_pub_b64,
+                "ciphertext": ct,
+                "signature": sig,
+                "ts": int(time.time()),
+                "ttl": ttl,
+                "nonce": base64.b64encode(nonce).decode(),  # NEW: store nonce for audit/debug
+                "delivered": 0,
+                "synced": 0,
+            }
+            self.store.upsert_message(m)
+            return m
 
     def try_deliver_locally(self, msg: Dict):
         # if message is for us, open and print; mark delivered
-        if msg['recipient_pub'] == self.identity.pub_b64:
-            # verify signature
-            if not verify(msg['signature'], (msg['id'] + msg['recipient_pub']).encode(), msg['sender_sig_pub']):
+        if msg["recipient_pub"] == self.identity.pub_b64:
+            # verify sender signature
+            if not verify(msg["signature"], (msg["id"] + msg["recipient_pub"]).encode(), msg["sender_sig_pub"]):
                 return
             try:
-                pt = open_sealed(self.identity, msg['ciphertext']).decode()
+                pt = open_sealed(self.identity, msg["ciphertext"]).decode()
                 print(f"\n[DELIVERED] from={msg['sender_pub'][:16]}... id={msg['id'][:12]} msg=\n  {pt}\n")
-                self.store.mark_delivered(msg['id'])
+                self.store.mark_delivered(msg["id"])
             except Exception:
                 pass
 
     # ---- Mesh: discovery + gossip ----
     async def multicast_hello_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        ttl_bin = struct.pack('@i', 1)
+        ttl_bin = struct.pack("@i", 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl_bin)
         while True:
-            payload = json.dumps({
-                'type': 'hello',
-                'pub': self.identity.pub_b64,
-                'port': self.listen_port,
-            }).encode()
+            payload = json.dumps(
+                {"type": "hello", "pub": self.identity.pub_b64, "port": self.listen_port}
+            ).encode()
+            # Debug: who we advertise as
+            # print("HELLO advertise:", self.identity.pub_b64, "port", self.listen_port)
             sock.sendto(payload, (MULTICAST_GRP, MULTICAST_PORT))
             await asyncio.sleep(HELLO_INTERVAL)
 
     async def multicast_listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        # allow multiple processes to bind same mcast port (needed on macOS)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('', MULTICAST_PORT))
-        mreq = struct.pack('4sl', socket.inet_aton(MULTICAST_GRP), socket.INADDR_ANY)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except AttributeError:
+            pass
+
+        sock.bind(("", MULTICAST_PORT))
+        mreq = struct.pack("4sl", socket.inet_aton(MULTICAST_GRP), socket.INADDR_ANY)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.setblocking(False)
         loop = asyncio.get_event_loop()
@@ -98,13 +134,13 @@ class Node:
             try:
                 data, addr = await loop.run_in_executor(None, sock.recvfrom, 65536)
                 msg = json.loads(data.decode())
-                if msg.get('type') == 'hello' and msg.get('pub') != self.identity.pub_b64:
-                    self.store.save_peer(msg['pub'], addr[0], int(msg['port']))
+                if msg.get("type") == "hello" and msg.get("pub") != self.identity.pub_b64:
+                    self.store.save_peer(msg["pub"], addr[0], int(msg["port"]))
             except Exception:
                 await asyncio.sleep(0.1)
 
     async def gossip_server(self):
-        server = await asyncio.start_server(self.handle_peer_conn, host='0.0.0.0', port=self.listen_port)
+        server = await asyncio.start_server(self.handle_peer_conn, host="0.0.0.0", port=self.listen_port)
         async with server:
             await server.serve_forever()
 
@@ -112,56 +148,59 @@ class Node:
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=5)
             header = json.loads(raw.decode())
-            if header.get('type') != 'pull':
+            if header.get("type") != "pull":
                 writer.close(); await writer.wait_closed(); return
-            their_pub = header.get('pub')
-            # 1) Send any messages we have for them
+            their_pub = header.get("pub")
+
+            # Send any messages we have for them
             msgs = self.store.outbox_for_recipient(their_pub)
-            writer.write((json.dumps({'type':'push','count':len(msgs)})+'\n').encode())
+            writer.write((json.dumps({"type": "push", "count": len(msgs)}) + "\n").encode())
             await writer.drain()
+
             for m in msgs:
-                out = m.copy();
-                # base64-encode binary fields for transport
-                out['ciphertext'] = base64.b64encode(out['ciphertext']).decode()
-                out['signature'] = base64.b64encode(out['signature']).decode()
-                writer.write((json.dumps({'type':'msg','data':out})+'\n').encode())
+                out = m.copy()
+                out["ciphertext"] = base64.b64encode(out["ciphertext"]).decode()
+                out["signature"] = base64.b64encode(out["signature"]).decode()
+                writer.write((json.dumps({"type": "msg", "data": out}) + "\n").encode())
                 await writer.drain()
-            writer.write((json.dumps({'type':'end'})+'\n').encode())
+                # mark that we already forwarded this message to this peer (prevents repeats)
+                self.store.mark_forwarded(their_pub, m["id"])
+
+            writer.write((json.dumps({"type": "end"}) + "\n").encode())
             await writer.drain()
         except Exception:
             pass
         finally:
             writer.close(); await writer.wait_closed()
 
+
     async def gossip_client_loop(self):
         while True:
-            # forward/flood pending (TTL>0) to any peers we know
-            pending = self.store.pending_for_mesh_forward()
-            # build peer list
+            # build peer list (multicast keeps this fresh)
             peers = self.store.db.execute("SELECT pubkey,host,tcp_port FROM peers").fetchall()
             for pub, host, port in peers:
-                # pull from them any messages destined to us; also gives them a chance to request ours
                 try:
                     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=1.5)
-                    writer.write((json.dumps({'type':'pull','pub': self.identity.pub_b64})+'\n').encode())
+                    writer.write((json.dumps({"type": "pull", "pub": self.identity.pub_b64}) + "\n").encode())
                     await writer.drain()
 
                     while True:
                         line = await asyncio.wait_for(reader.readline(), timeout=2)
-                        if not line: break
+                        if not line:
+                            break
                         evt = json.loads(line.decode())
-                        if evt.get('type') == 'msg':
-                            m = evt['data']
-                            m['ciphertext'] = base64.b64decode(m['ciphertext'])
-                            m['signature'] = base64.b64decode(m['signature'])
+                        if evt.get("type") == "msg":
+                            m = evt["data"]
+                            m["ciphertext"] = base64.b64decode(m["ciphertext"])
+                            m["signature"] = base64.b64decode(m["signature"])
                             inserted = self.store.upsert_message(m)
                             if inserted:
                                 self.try_deliver_locally(m)
-                                # decrement TTL and keep circulating if not delivered
-                                if m['recipient_pub'] != self.identity.pub_b64 and m['ttl'] > 0:
-                                    m2 = m.copy(); m2['ttl'] = m['ttl'] - 1
+                                # keep circulating if not for us
+                                if m["recipient_pub"] != self.identity.pub_b64 and m["ttl"] > 0:
+                                    m2 = m.copy(); m2["ttl"] = m["ttl"] - 1
                                     self.store.upsert_message(m2)
-                        elif evt.get('type') == 'end':
+                        elif evt.get("type") == "end":
                             break
                 except Exception:
                     continue
@@ -172,7 +211,7 @@ class Node:
         if not self.server_url:
             return False
         try:
-            r = self.session.get(self.server_url + '/ping', timeout=2)
+            r = self.session.get(self.server_url + "/ping", timeout=2)
             return r.status_code == 200
         except Exception:
             return False
@@ -186,19 +225,21 @@ class Node:
                     wire = []
                     for m in batch:
                         out = m.copy()
-                        out['ciphertext'] = base64.b64encode(out['ciphertext']).decode()
-                        out['signature'] = base64.b64encode(out['signature']).decode()
+                        out["ciphertext"] = base64.b64encode(out["ciphertext"]).decode()
+                        out["signature"] = base64.b64encode(out["signature"]).decode()
                         wire.append(out)
                     if wire:
-                        r = self.session.post(self.server_url + '/sync', json={'msgs': wire}, timeout=8)
+                        r = self.session.post(self.server_url + "/sync", json={"msgs": wire}, timeout=8)
                         if r.ok:
-                            self.store.mark_synced([m['id'] for m in batch])
+                            self.store.mark_synced([m["id"] for m in batch])
+
                     # pull for us
+                    # print("SYNC pull recipient:", self.identity.pub_b64)
                     r = self.session.get(self.server_url + f"/pull?recipient={self.identity.pub_b64}", timeout=8)
                     if r.ok:
-                        for m in r.json().get('msgs', []):
-                            m['ciphertext'] = base64.b64decode(m['ciphertext'])
-                            m['signature'] = base64.b64decode(m['signature'])
+                        for m in r.json().get("msgs", []):
+                            m["ciphertext"] = base64.b64decode(m["ciphertext"])
+                            m["signature"] = base64.b64decode(m["signature"])
                             inserted = self.store.upsert_message(m)
                             if inserted:
                                 self.try_deliver_locally(m)
@@ -206,12 +247,14 @@ class Node:
                     pass
             await asyncio.sleep(5)
 
+# ---------- runner ----------
 
-async def main_node(cfg: str, send_to: str | None, text: str | None, ttl: int):
-    node = Node(cfg)
-    # Optionally send a message and exit
+async def main_node(cfg_path: str, send_to: Optional[str], text: Optional[str], ttl: int):
+    node = Node(cfg_path)
+
+    # One-shot send and exit
     if send_to and text is not None:
-        node.create_message(send_to, text, ttl=ttl)
+        node.create_message(_normalize_recipient(send_to), text, ttl=ttl)
         print("Queued message; it will deliver via mesh and/or server when possible.")
         return
 
@@ -224,12 +267,39 @@ async def main_node(cfg: str, send_to: str | None, text: str | None, ttl: int):
         node.sync_loop(),
     )
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Hybrid Mesh Messenger Node")
+    parser.add_argument("--config", help="Path to TOML config (if omitted, auto-init is used)")
+    parser.add_argument("--send-to", help="Recipient public key (b64 or mesh:<enc>.<sig>)")
+    parser.add_argument("--text", help="Message text")
+    parser.add_argument("--ttl", type=int, default=MESH_TTL_DEFAULT)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Hybrid Mesh Messenger Node')
-    parser.add_argument('--config', required=True, help='Path to TOML config')
-    parser.add_argument('--send-to', help='Recipient public key (b64)')
-    parser.add_argument('--text', help='Message text')
-    parser.add_argument('--ttl', type=int, default=MESH_TTL_DEFAULT)
+    # Auto-init knobs (ignored if --config is given)
+    parser.add_argument("--profile", help='Profile name (env MESH_PROFILE or "default")')
+    parser.add_argument("--port", type=int, help="Preferred mesh TCP port (else auto-find)")
+    parser.add_argument("--server", help="Central sync server URL (http or .onion)")
+    parser.add_argument("--safety-mode", action="store_true", help="Use Tor for server sync")
+    parser.add_argument("--tor-socks", default=None, help="Tor SOCKS endpoint (e.g., socks5h://127.0.0.1:9050)")
+    parser.add_argument("--print-address", action="store_true", help="Print address and exit")
+
     args = parser.parse_args()
-    asyncio.run(main_node(args.config, args.send_to, args.text, args.ttl))
+
+    if args.config:
+        cfg_path = args.config
+        if args.print_address and not (args.send_to or args.text):
+            n = Node(cfg_path)
+            print(format_address(n.identity))
+        else:
+            asyncio.run(main_node(cfg_path, args.send_to, args.text, args.ttl))
+    else:
+        cfg_path, cfg, ident, address = ensure_initialized(
+            profile=args.profile,
+            server_url=args.server,
+            safety_mode=True if args.safety_mode else None,
+            tor_socks=args.tor_socks,
+            prefer_port=args.port,
+        )
+        if args.print_address and not (args.send_to or args.text):
+            print(address)
+        else:
+            asyncio.run(main_node(cfg_path, args.send_to, args.text, args.ttl))

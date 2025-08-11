@@ -7,6 +7,7 @@ from nacl.public import PrivateKey, PublicKey, SealedBox
 from nacl.signing import SigningKey, VerifyKey
 from nacl.hash import blake2b
 from nacl.encoding import RawEncoder
+import msgpack
 
 
 @dataclass
@@ -29,17 +30,37 @@ class Identity:
 
 def load_or_create_identity(path: str) -> Identity:
     if os.path.exists(path):
-        with open(path, 'rb') as f:
-            blob = f.read()
-        enc_sk = PrivateKey(blob[:32])
-        sig_sk = SigningKey(blob[32:64])
+        blob = open(path, "rb").read()
+        # Try msgpack (new format)
+        try:
+            obj = msgpack.unpackb(blob, raw=False)
+            enc_sk = PrivateKey(obj["enc_sk"])
+            sig_sk = SigningKey(obj["sig_sk"])
+            return Identity(priv=enc_sk, pub=enc_sk.public_key,
+                            sign_priv=sig_sk, sign_pub=sig_sk.verify_key)
+        except Exception:
+            # Fallback: legacy 64-byte (enc_sk || sig_sk)
+            if len(blob) < 64:
+                raise ValueError(f"Identity file too short: {path}")
+            enc_sk = PrivateKey(blob[:32])
+            sig_sk = SigningKey(blob[32:64])
+            return Identity(priv=enc_sk, pub=enc_sk.public_key,
+                            sign_priv=sig_sk, sign_pub=sig_sk.verify_key)
     else:
+        # Create new (msgpack format to match bootstrap/init_node)
         enc_sk = PrivateKey.generate()
         sig_sk = SigningKey.generate()
-        with open(path, 'wb') as f:
-            f.write(bytes(enc_sk) + bytes(sig_sk))
-    return Identity(priv=enc_sk, pub=enc_sk.public_key, sign_priv=sig_sk, sign_pub=sig_sk.verify_key)
-
+        ident = {
+            "version": 1,
+            "enc_sk": bytes(enc_sk),
+            "enc_pk": bytes(enc_sk.public_key),
+            "sig_sk": bytes(sig_sk),
+            "sig_pk": bytes(sig_sk.verify_key),
+        }
+        with open(path, "wb") as f:
+            f.write(msgpack.packb(ident, use_bin_type=True))
+        return Identity(priv=enc_sk, pub=enc_sk.public_key,
+                        sign_priv=sig_sk, sign_pub=sig_sk.verify_key)
 
 def seal_for(recipient_pub_b64: str, plaintext: bytes) -> bytes:
     pub = PublicKey(base64.b64decode(recipient_pub_b64))

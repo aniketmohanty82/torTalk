@@ -1,4 +1,4 @@
-# MeshMsg (alpha) — Hybrid Mesh + Tor Messenger
+# torTalk (alpha) — Hybrid Mesh + Tor Messenger
 
 > A minimal, privacy-first messenger that works on LAN mesh (no internet), and opportunistically syncs via a relay server — optionally over Tor.
 
@@ -222,7 +222,7 @@ If your server provides `/onion`, the client will attempt to switch to it when S
 A profile directory contains your settings, identity, and local DB:
 
 ```
-<platform-data-dir>/meshmsg/<profile>/
+<platform-data-dir>/torTalk/<profile>/
  ├── settings.toml
  ├── identity.bin
  └── store.sqlite
@@ -232,10 +232,10 @@ Typical `settings.toml`:
 
 ```toml
 [identity]
-path = "/…/meshmsg/Alice/identity.bin"
+path = "/…/torTalk/Alice/identity.bin"
 
 [storage]
-path = "/…/meshmsg/Alice/store.sqlite"
+path = "/…/torTalk/Alice/store.sqlite"
 
 [network]
 tcp_port = 45454

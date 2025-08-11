@@ -36,6 +36,7 @@ def _default_cfg(dirpath: Path, port: int, server_url: str, safety_mode: bool, t
         "identity": {"path": str(dirpath / "identity.bin")},
         "storage": {"path": str(dirpath / "store.sqlite")},
         "network": {"tcp_port": port},
+        "user": {"username": os.getenv("MESH_USERNAME", f"user-{secrets.token_hex(3)}")},
         "server": {
             "url": server_url,
             "safety_mode": bool(safety_mode),

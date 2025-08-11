@@ -1,0 +1,15 @@
+# core
+pynacl
+msgpack
+requests
+toml
+platformdirs
+
+# server
+Flask
+flask-cors
+
+# GUI
+PySide6
+qasync
+stem

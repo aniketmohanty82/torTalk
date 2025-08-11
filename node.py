@@ -14,7 +14,7 @@ from crypto_utils import Identity, load_or_create_identity, seal_for, open_seale
 from nacl.hash import blake2b
 from nacl.encoding import RawEncoder
 from store import Store
-from typing import Dict, Optional
+from typing import Dict, Optional, Callable 
 
 # ---------- helpers ----------
 
@@ -51,21 +51,60 @@ MESH_TTL_DEFAULT = 4         # max hops in LAN flood
 # ---------- node ----------
 
 class Node:
-    def __init__(self, cfg_path: str):
-        with open(cfg_path, "rb") as f:
+    def __init__(self, cfg_path: str, on_delivered: Optional[Callable[[Dict], None]] = None):
+        with open(cfg_path, 'rb') as f:
             cfg = tomllib.load(f)
 
         self.identity: Identity = load_or_create_identity(cfg["identity"]["path"])
+        self.username = (cfg.get("user", {}) or {}).get("username") or f"user-{self.identity.pub_b64[:6]}"
+        self.admin_mode = True  # TEMP: grant superuser for now
+
         self.store = Store(cfg["storage"]["path"])
         self.listen_port = int(cfg["network"].get("tcp_port", GOSSIP_PORT_DEFAULT))
         self.server_url = cfg["server"].get("url")
-        self.tor_socks = cfg["server"].get("tor_socks")  # e.g., "socks5h://127.0.0.1:9050"
+        self.tor_socks = cfg["server"].get("tor_socks")
         self.safety_mode = bool(cfg["server"].get("safety_mode", False))
+        self.on_delivered = on_delivered
 
         self.session = requests.Session()
         if self.safety_mode and self.tor_socks:
             self.session.proxies = {"http": self.tor_socks, "https": self.tor_socks}
 
+    def set_safety_mode(self, enabled: bool, tor_socks: Optional[str] = None):
+        self.safety_mode = bool(enabled)
+        if tor_socks:
+            self.tor_socks = tor_socks
+        if self.safety_mode and self.tor_socks:
+            self.session.proxies = {"http": self.tor_socks, "https": self.tor_socks}
+        else:
+            self.session.proxies = {}
+
+    def send_text(self, recipient_any: str, text: str, ttl: int = MESH_TTL_DEFAULT) -> Dict:
+        s = recipient_any.strip()
+        if s.startswith("mesh:"):
+            s = s.split("mesh:", 1)[1]
+        if "." in s:
+            s = s.split(".", 1)[0]
+        return self.create_message(s, text, ttl=ttl)
+
+    async def start(self):
+        self._tasks = [
+            asyncio.create_task(self.multicast_hello_loop()),
+            asyncio.create_task(self.multicast_listen_loop()),
+            asyncio.create_task(self.gossip_server()),
+            asyncio.create_task(self.gossip_client_loop()),
+            asyncio.create_task(self.sync_loop()),
+        ]
+
+    async def stop(self):
+        tasks = getattr(self, "_tasks", [])
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+        
     # ---- Message API ----
     def create_message(self, recipient_pub_b64: str, plaintext: str, ttl: int = MESH_TTL_DEFAULT) -> Dict:
             nonce = os.urandom(16)  # NEW: per-message nonce
@@ -99,6 +138,8 @@ class Node:
                 pt = open_sealed(self.identity, msg["ciphertext"]).decode()
                 print(f"\n[DELIVERED] from={msg['sender_pub'][:16]}... id={msg['id'][:12]} msg=\n  {pt}\n")
                 self.store.mark_delivered(msg["id"])
+                if self.on_delivered:
+                    self.on_delivered({"id": msg["id"], "sender_pub": msg["sender_pub"], "text": pt, "ts": msg.get("ts")})
             except Exception:
                 pass
 
@@ -108,11 +149,12 @@ class Node:
         ttl_bin = struct.pack("@i", 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl_bin)
         while True:
-            payload = json.dumps(
-                {"type": "hello", "pub": self.identity.pub_b64, "port": self.listen_port}
-            ).encode()
-            # Debug: who we advertise as
-            # print("HELLO advertise:", self.identity.pub_b64, "port", self.listen_port)
+            payload = json.dumps({
+                "type": "hello",
+                "pub": self.identity.pub_b64,
+                "port": self.listen_port,
+                "username": self.username,          # NEW
+            }).encode()
             sock.sendto(payload, (MULTICAST_GRP, MULTICAST_PORT))
             await asyncio.sleep(HELLO_INTERVAL)
 
@@ -135,7 +177,7 @@ class Node:
                 data, addr = await loop.run_in_executor(None, sock.recvfrom, 65536)
                 msg = json.loads(data.decode())
                 if msg.get("type") == "hello" and msg.get("pub") != self.identity.pub_b64:
-                    self.store.save_peer(msg["pub"], addr[0], int(msg["port"]))
+                    self.store.save_peer(msg["pub"], addr[0], int(msg["port"]), msg.get("username"))
             except Exception:
                 await asyncio.sleep(0.1)
 
@@ -148,11 +190,17 @@ class Node:
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=5)
             header = json.loads(raw.decode())
-            if header.get("type") != "pull":
+            if header.get("type") != "pull":               # restore guard
                 writer.close(); await writer.wait_closed(); return
             their_pub = header.get("pub")
 
-            # Send any messages we have for them
+            # ACL: only send to friend peers unless admin_mode
+            if not self.admin_mode and not self.store.is_friend(their_pub):
+                writer.write((json.dumps({"type":"end"})+"\n").encode())
+                await writer.drain()
+                writer.close(); await writer.wait_closed()
+                return
+
             msgs = self.store.outbox_for_recipient(their_pub)
             writer.write((json.dumps({"type": "push", "count": len(msgs)}) + "\n").encode())
             await writer.drain()
@@ -161,10 +209,9 @@ class Node:
                 out = m.copy()
                 out["ciphertext"] = base64.b64encode(out["ciphertext"]).decode()
                 out["signature"] = base64.b64encode(out["signature"]).decode()
-                writer.write((json.dumps({"type": "msg", "data": out}) + "\n").encode())
+                writer.write((json.dumps({"type":"msg","data":out})+"\n").encode())
                 await writer.drain()
-                # mark that we already forwarded this message to this peer (prevents repeats)
-                self.store.mark_forwarded(their_pub, m["id"])
+                self.store.mark_forwarded(their_pub, m["id"])  # inside loop
 
             writer.write((json.dumps({"type": "end"}) + "\n").encode())
             await writer.drain()

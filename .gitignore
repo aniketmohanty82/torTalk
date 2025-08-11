@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+server_store.sqlite
+server_store.sqlite-shm
+.gitignore

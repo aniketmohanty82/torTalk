@@ -359,11 +359,6 @@ The `payload` is a JSON blob containing **ciphertext** and metadata only. The se
 - Opportunistic NAT traversal / WebRTC datachannels.
 - Automatic onion service provisioning and life-cycle management.
 
----
-
-## License
-
-TBD — pick your preferred open-source license.
 
 ---
 

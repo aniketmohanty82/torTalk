@@ -82,15 +82,16 @@ flowchart LR
 ### Components
 
 ```mermaid
-graph TD
-  GUI[gui_qt.py\n(PySide6 + qasync)] --> NodePy[node.py\n(mesh + sync + crypto)]
-  NodePy --> StorePy[store.py\n(SQLite: messages/peers/forwarded)]
-  NodePy --> Crypto[crypto_utils.py\n(X25519/Ed25519)]
-  NodePy --> Bootstrap[bootstrap.py\n(profile + settings.toml)]
-  NodePy -->|HTTP(S)/SOCKS| ServerPy[server.py\n(Flask relay)]
+flowchart TD
+  GUI[gui_qt.py\nPySide6 and qasync] --> NodePy[node.py\nmesh + sync + crypto]
+  NodePy --> StorePy[store.py\nSQLite messages/peers/forwarded]
+  NodePy --> Crypto[crypto_utils.py\nX25519 and Ed25519]
+  NodePy --> Bootstrap[bootstrap.py\nprofile + settings.toml]
+  NodePy -->|HTTP or Tor SOCKS| ServerPy[server.py\nFlask relay]
 
   ServerPy -->|SQLite| ServerDB[(server_store.sqlite)]
   StorePy -->|SQLite| ClientDB[(store.sqlite)]
+
 ```
 
 ### Message Flow

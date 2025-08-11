@@ -8,7 +8,7 @@ from platformdirs import user_data_dir
 from nacl.public import PrivateKey as Curve25519PrivateKey
 from nacl.signing import SigningKey as Ed25519SigningKey
 
-APP_NAME = "meshmsg"
+APP_NAME = "torTalk"
 
 def _b64(b: bytes) -> str:
     import base64 as b64m

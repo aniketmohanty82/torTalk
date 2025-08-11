@@ -3,27 +3,32 @@ import asyncio
 import base64
 import json
 import os
-import requests
 import socket
 import struct
 import time
-import tomllib
+from typing import Dict, Optional, Callable
 
-from bootstrap import ensure_initialized
-from crypto_utils import Identity, load_or_create_identity, seal_for, open_sealed, sign, verify, msg_id
+import requests
+import tomllib
+import toml  # for writing settings.toml
 from nacl.hash import blake2b
 from nacl.encoding import RawEncoder
+
+from bootstrap import ensure_initialized
+from crypto_utils import (
+    Identity, load_or_create_identity, seal_for,
+    open_sealed, sign, verify
+)
 from store import Store
-from typing import Dict, Optional, Callable 
 
 # ---------- helpers ----------
 
 def format_address(identity: Identity) -> str:
-    # mesh:<enc_b64>.<sig_b64>
+    """Return 'mesh:<enc_b64>.<sig_b64>' for sharing."""
     return f"mesh:{identity.pub_b64}.{identity.sign_b64}"
 
 def _normalize_recipient(s: Optional[str]) -> Optional[str]:
-    """Allow --send-to to be either <enc_b64> or mesh:<enc>.<sig>."""
+    """Allow --send-to to be either <enc_b64> or 'mesh:<enc>.<sig>'."""
     if not s:
         return s
     s = s.strip()
@@ -34,10 +39,10 @@ def _normalize_recipient(s: Optional[str]) -> Optional[str]:
     return s
 
 def _msg_id(sender_b64: str, recipient_b64: str, nonce: bytes) -> str:
+    """Stable(ish) id per (sender, recipient, nonce)."""
     return blake2b(
         (sender_b64 + "|" + recipient_b64).encode() + nonce, encoder=RawEncoder
     ).hex()
-
 
 # ---------- constants ----------
 
@@ -51,26 +56,83 @@ MESH_TTL_DEFAULT = 4         # max hops in LAN flood
 # ---------- node ----------
 
 class Node:
+    """
+    Hybrid Mesh Messenger node:
+      - LAN multicast discovery + TCP gossip
+      - Optional server sync (direct or via Tor SOCKS)
+      - Settings persistence helpers for server_url and username
+    """
     def __init__(self, cfg_path: str, on_delivered: Optional[Callable[[Dict], None]] = None):
-        with open(cfg_path, 'rb') as f:
+        self.cfg_path = cfg_path
+        with open(cfg_path, "rb") as f:
             cfg = tomllib.load(f)
 
         self.identity: Identity = load_or_create_identity(cfg["identity"]["path"])
         self.username = (cfg.get("user", {}) or {}).get("username") or f"user-{self.identity.pub_b64[:6]}"
-        self.admin_mode = True  # TEMP: grant superuser for now
+        self.admin_mode = True  # TEMP: grant superuser for now (we’ll tighten later)
 
         self.store = Store(cfg["storage"]["path"])
         self.listen_port = int(cfg["network"].get("tcp_port", GOSSIP_PORT_DEFAULT))
-        self.server_url = cfg["server"].get("url")
-        self.tor_socks = cfg["server"].get("tor_socks")
-        self.safety_mode = bool(cfg["server"].get("safety_mode", False))
+        self.server_url = (cfg.get("server") or {}).get("url")
+        self.tor_socks = (cfg.get("server") or {}).get("tor_socks")
+        self.safety_mode = bool((cfg.get("server") or {}).get("safety_mode", False))
         self.on_delivered = on_delivered
 
         self.session = requests.Session()
         if self.safety_mode and self.tor_socks:
             self.session.proxies = {"http": self.tor_socks, "https": self.tor_socks}
+        else:
+            self.session.proxies = {}
+
+        self._tasks: list[asyncio.Task] = []
+
+    # ---------- persistence helpers ----------
+
+    def _load_cfg(self) -> dict:
+        with open(self.cfg_path, "rb") as f:
+            return tomllib.load(f)
+
+    def _write_cfg(self, cfg: dict) -> None:
+        os.makedirs(os.path.dirname(self.cfg_path), exist_ok=True)
+        with open(self.cfg_path, "w") as f:
+            toml.dump(cfg, f)
+
+    def persist_server_url(self, new_url: str,
+                           safety_mode: Optional[bool] = None,
+                           tor_socks: Optional[str] = None) -> None:
+        """
+        Persist server.url (and optionally safety_mode/tor_socks) to settings.toml,
+        and update in-memory values + session proxies.
+        """
+        cfg = self._load_cfg()
+        cfg.setdefault("server", {})
+        cfg["server"]["url"] = new_url
+        if safety_mode is not None:
+            cfg["server"]["safety_mode"] = bool(safety_mode)
+        if tor_socks is not None:
+            cfg["server"]["tor_socks"] = tor_socks
+        self._write_cfg(cfg)
+
+        # reflect in-memory
+        self.server_url = new_url
+        if safety_mode is not None or tor_socks is not None:
+            self.set_safety_mode(
+                enabled=self.safety_mode if safety_mode is None else bool(safety_mode),
+                tor_socks=self.tor_socks if tor_socks is None else tor_socks
+            )
+
+    def persist_username(self, new_username: str) -> None:
+        """Persist user.username into settings.toml and update self.username."""
+        cfg = self._load_cfg()
+        cfg.setdefault("user", {})
+        cfg["user"]["username"] = new_username
+        self._write_cfg(cfg)
+        self.username = new_username
+
+    # ---------- public controls ----------
 
     def set_safety_mode(self, enabled: bool, tor_socks: Optional[str] = None):
+        """Flip Safety (Tor) ON/OFF; optionally update tor_socks."""
         self.safety_mode = bool(enabled)
         if tor_socks:
             self.tor_socks = tor_socks
@@ -80,6 +142,7 @@ class Node:
             self.session.proxies = {}
 
     def send_text(self, recipient_any: str, text: str, ttl: int = MESH_TTL_DEFAULT) -> Dict:
+        """Convenience: accept mesh:<enc>.<sig> or raw enc b64."""
         s = recipient_any.strip()
         if s.startswith("mesh:"):
             s = s.split("mesh:", 1)[1]
@@ -88,62 +151,66 @@ class Node:
         return self.create_message(s, text, ttl=ttl)
 
     async def start(self):
+        """Start all background loops."""
         self._tasks = [
-            asyncio.create_task(self.multicast_hello_loop()),
-            asyncio.create_task(self.multicast_listen_loop()),
-            asyncio.create_task(self.gossip_server()),
-            asyncio.create_task(self.gossip_client_loop()),
-            asyncio.create_task(self.sync_loop()),
+            asyncio.create_task(self.multicast_hello_loop(), name="mcast-hello"),
+            asyncio.create_task(self.multicast_listen_loop(), name="mcast-listen"),
+            asyncio.create_task(self.gossip_server(), name="gossip-server"),
+            asyncio.create_task(self.gossip_client_loop(), name="gossip-client"),
+            asyncio.create_task(self.sync_loop(), name="sync"),
         ]
 
     async def stop(self):
-        tasks = getattr(self, "_tasks", [])
+        """Stop background loops."""
+        tasks = list(self._tasks)
+        self._tasks.clear()
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    # ---------- Message API ----------
 
-        
-    # ---- Message API ----
-    def create_message(self, recipient_pub_b64: str, plaintext: str, ttl: int = MESH_TTL_DEFAULT) -> Dict:
-            nonce = os.urandom(16)  # NEW: per-message nonce
-            ct = seal_for(recipient_pub_b64, plaintext.encode())
-            mid = _msg_id(self.identity.pub_b64, recipient_pub_b64, nonce)  # NEW: stable id
-            payload = (mid + recipient_pub_b64).encode()  # unchanged binding for signature
-            sig = sign(self.identity, payload)
-            m = {
-                "id": mid,
-                "sender_pub": self.identity.pub_b64,
-                "sender_sig_pub": self.identity.sign_b64,
-                "recipient_pub": recipient_pub_b64,
-                "ciphertext": ct,
-                "signature": sig,
-                "ts": int(time.time()),
-                "ttl": ttl,
-                "nonce": base64.b64encode(nonce).decode(),  # NEW: store nonce for audit/debug
-                "delivered": 0,
-                "synced": 0,
-            }
-            self.store.upsert_message(m)
-            return m
+    def create_message(self, recipient_pub_b64: str, plaintext: str,
+                       ttl: int = MESH_TTL_DEFAULT) -> Dict:
+        nonce = os.urandom(16)
+        ct = seal_for(recipient_pub_b64, plaintext.encode())
+        mid = _msg_id(self.identity.pub_b64, recipient_pub_b64, nonce)
+        payload = (mid + recipient_pub_b64).encode()
+        sig = sign(self.identity, payload)
+        m = {
+            "id": mid,
+            "sender_pub": self.identity.pub_b64,
+            "sender_sig_pub": self.identity.sign_b64,
+            "recipient_pub": recipient_pub_b64,
+            "ciphertext": ct,
+            "signature": sig,
+            "ts": int(time.time()),
+            "ttl": ttl,
+            "nonce": base64.b64encode(nonce).decode(),
+            "delivered": 0,
+            "synced": 0,
+        }
+        self.store.upsert_message(m)
+        return m
 
     def try_deliver_locally(self, msg: Dict):
-        # if message is for us, open and print; mark delivered
-        if msg["recipient_pub"] == self.identity.pub_b64:
-            # verify sender signature
-            if not verify(msg["signature"], (msg["id"] + msg["recipient_pub"]).encode(), msg["sender_sig_pub"]):
-                return
-            try:
-                pt = open_sealed(self.identity, msg["ciphertext"]).decode()
-                print(f"\n[DELIVERED] from={msg['sender_pub'][:16]}... id={msg['id'][:12]} msg=\n  {pt}\n")
-                self.store.mark_delivered(msg["id"])
-                if self.on_delivered:
-                    self.on_delivered({"id": msg["id"], "sender_pub": msg["sender_pub"], "text": pt, "ts": msg.get("ts")})
-            except Exception:
-                pass
+        """If message is for us, verify, decrypt, mark delivered, and notify GUI."""
+        if msg["recipient_pub"] != self.identity.pub_b64:
+            return
+        if not verify(msg["signature"], (msg["id"] + msg["recipient_pub"]).encode(), msg["sender_sig_pub"]):
+            return
+        try:
+            pt = open_sealed(self.identity, msg["ciphertext"]).decode()
+            print(f"\n[DELIVERED] from={msg['sender_pub'][:16]}... id={msg['id'][:12]} msg=\n  {pt}\n")
+            self.store.mark_delivered(msg["id"])
+            if self.on_delivered:
+                self.on_delivered({"id": msg["id"], "sender_pub": msg["sender_pub"], "text": pt, "ts": msg.get("ts")})
+        except Exception:
+            pass
 
-    # ---- Mesh: discovery + gossip ----
+    # ---------- Mesh: discovery + gossip ----------
+
     async def multicast_hello_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         ttl_bin = struct.pack("@i", 1)
@@ -153,20 +220,18 @@ class Node:
                 "type": "hello",
                 "pub": self.identity.pub_b64,
                 "port": self.listen_port,
-                "username": self.username,          # NEW
+                "username": self.username,
             }).encode()
             sock.sendto(payload, (MULTICAST_GRP, MULTICAST_PORT))
             await asyncio.sleep(HELLO_INTERVAL)
 
     async def multicast_listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        # allow multiple processes to bind same mcast port (needed on macOS)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except AttributeError:
             pass
-
         sock.bind(("", MULTICAST_PORT))
         mreq = struct.pack("4sl", socket.inet_aton(MULTICAST_GRP), socket.INADDR_ANY)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
@@ -190,13 +255,13 @@ class Node:
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=5)
             header = json.loads(raw.decode())
-            if header.get("type") != "pull":               # restore guard
+            if header.get("type") != "pull":
                 writer.close(); await writer.wait_closed(); return
             their_pub = header.get("pub")
 
             # ACL: only send to friend peers unless admin_mode
             if not self.admin_mode and not self.store.is_friend(their_pub):
-                writer.write((json.dumps({"type":"end"})+"\n").encode())
+                writer.write((json.dumps({"type": "end"}) + "\n").encode())
                 await writer.drain()
                 writer.close(); await writer.wait_closed()
                 return
@@ -209,9 +274,9 @@ class Node:
                 out = m.copy()
                 out["ciphertext"] = base64.b64encode(out["ciphertext"]).decode()
                 out["signature"] = base64.b64encode(out["signature"]).decode()
-                writer.write((json.dumps({"type":"msg","data":out})+"\n").encode())
+                writer.write((json.dumps({"type": "msg", "data": out}) + "\n").encode())
                 await writer.drain()
-                self.store.mark_forwarded(their_pub, m["id"])  # inside loop
+                self.store.mark_forwarded(their_pub, m["id"])
 
             writer.write((json.dumps({"type": "end"}) + "\n").encode())
             await writer.drain()
@@ -220,10 +285,8 @@ class Node:
         finally:
             writer.close(); await writer.wait_closed()
 
-
     async def gossip_client_loop(self):
         while True:
-            # build peer list (multicast keeps this fresh)
             peers = self.store.db.execute("SELECT pubkey,host,tcp_port FROM peers").fetchall()
             for pub, host, port in peers:
                 try:
@@ -243,7 +306,6 @@ class Node:
                             inserted = self.store.upsert_message(m)
                             if inserted:
                                 self.try_deliver_locally(m)
-                                # keep circulating if not for us
                                 if m["recipient_pub"] != self.identity.pub_b64 and m["ttl"] > 0:
                                     m2 = m.copy(); m2["ttl"] = m["ttl"] - 1
                                     self.store.upsert_message(m2)
@@ -253,7 +315,8 @@ class Node:
                     continue
             await asyncio.sleep(GOSSIP_INTERVAL)
 
-    # ---- Server sync (direct or via Tor SOCKS) ----
+    # ---------- Server sync (direct or via Tor SOCKS) ----------
+
     def server_available(self) -> bool:
         if not self.server_url:
             return False
@@ -281,7 +344,6 @@ class Node:
                             self.store.mark_synced([m["id"] for m in batch])
 
                     # pull for us
-                    # print("SYNC pull recipient:", self.identity.pub_b64)
                     r = self.session.get(self.server_url + f"/pull?recipient={self.identity.pub_b64}", timeout=8)
                     if r.ok:
                         for m in r.json().get("msgs", []):

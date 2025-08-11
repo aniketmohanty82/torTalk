@@ -1,6 +1,6 @@
 # gui_qt.py
 # deps: PySide6 qasync stem
-import sys, asyncio, os, shutil, socket
+import sys, asyncio, os, shutil, socket, requests
 from typing import Dict, Optional
 
 from PySide6.QtWidgets import (
@@ -31,23 +31,16 @@ def _probe_local_socks(port: int) -> bool:
         return False
 
 def _find_tor_binary() -> str | None:
-    # env override first
     tor_path = os.environ.get("TOR_BINARY")
     if tor_path and os.path.exists(tor_path):
         return tor_path
-    # PATH
     tor_path = shutil.which("tor")
     if tor_path:
         return tor_path
-    # common mac/linux paths
     for p in ("/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor"):
         if os.path.exists(p):
             return p
-    # common Windows paths
-    for p in (
-        r"C:\Program Files\Tor\tor.exe",
-        r"C:\Program Files (x86)\Tor\tor.exe",
-    ):
+    for p in (r"C:\Program Files\Tor\tor.exe", r"C:\Program Files (x86)\Tor\tor.exe"):
         if os.path.exists(p):
             return p
     return None
@@ -65,16 +58,12 @@ class TorManager:
         self.enabling = False  # debounce flag
 
     async def start(self, profile_dir: str) -> str:
-        # reuse system Tor if already running
         if _probe_local_socks(9050):
             self.proc = None
             self.socks_port = 9050
             return "socks5h://127.0.0.1:9050"
-
-        # already launched privately?
         if self.proc and self.socks_port:
             return f"socks5h://127.0.0.1:{self.socks_port}"
-
         if launch_tor_with_config is None:
             raise RuntimeError("Missing dependency: pip install stem")
 
@@ -170,7 +159,7 @@ class ChatPane(QWidget):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MeshMsg (alpha)")
+        self.setWindowTitle("torTalk (alpha)")
 
         self.bridge = Bridge()
         self.bridge.delivered.connect(self.on_delivered)
@@ -240,6 +229,7 @@ class MainWindow(QWidget):
         self.tor_check.toggled.connect(self._on_tor_toggled)
         self.tor_active = False
         self.admin_check.stateChanged.connect(self._on_admin_toggle)
+        self.user_edit.editingFinished.connect(self._on_username_changed)
 
         # Runtime
         self.node: Optional[Node] = None
@@ -309,7 +299,6 @@ class MainWindow(QWidget):
         if not self.store:
             return
         self.people.clear()
-        # show only recently-seen peers so “ghosts” don’t appear
         for p in self.store.recent_peers(max_age=30):
             uname = p.get("username") or (p["pubkey"][:8] + "…")
             it = QListWidgetItem(uname)
@@ -347,6 +336,14 @@ class MainWindow(QWidget):
         if self.node:
             self.node.admin_mode = (state == Qt.Checked)
 
+    def _on_username_changed(self):
+        if not self.node: return
+        new_name = self.user_edit.text().strip()
+        if not new_name: return
+        self.node.persist_username(new_name)   # writes to settings.toml
+        self.node.username = new_name          # takes effect in next hello() tick
+        self.log.append(f"Username saved: {new_name}")
+
     # ── register / start ──
     @asyncSlot()
     async def _on_register_clicked(self):
@@ -373,7 +370,6 @@ class MainWindow(QWidget):
         self._refresh_people()
         asyncio.create_task(self._auto_refresh())
 
-        # If box is already checked, enable Tor once here (no duplicate calls)
         if self.tor_check.isChecked():
             await self._set_tor(True)
 
@@ -398,15 +394,36 @@ class MainWindow(QWidget):
     def _on_tor_toggled(self, checked: bool):
         asyncio.ensure_future(self._set_tor(checked))
 
+    async def _bind_onion_if_available(self, socks_uri: str) -> Optional[str]:
+        """If server exposes /onion, switch to .onion and persist. Return the URL if switched."""
+        if not self.node or not self.node.server_url:
+            return None
+        base = self.node.server_url.rstrip("/")
+        try:
+            r = await asyncio.to_thread(self.node.session.get, base + "/onion", timeout=5)
+            if r.ok:
+                onion = r.json().get("onion")
+                if onion and ".onion" in onion:
+                    onion_url = "http://" + onion
+                    if onion_url != base:
+                        # persist: url + safety + socks
+                        self.node.persist_server_url(onion_url, safety_mode=True, tor_socks=socks_uri)
+                        self.log.append(f"Server switched to onion and saved: {onion_url}")
+                        return onion_url
+        except Exception:
+            pass
+        # no onion endpoint: still persist "Safety ON" with current URL + socks
+        self.node.persist_server_url(self.node.server_url, safety_mode=True, tor_socks=socks_uri)
+        self.log.append("Safety ON saved (no /onion endpoint).")
+        return None
+
+
     async def _set_tor(self, checked: bool):
         if not self.node:
             self.log.append("Start the node first (Register / Start).")
-            self.tor_check.blockSignals(True)
-            self.tor_check.setChecked(False)
-            self.tor_check.blockSignals(False)
+            self.tor_check.blockSignals(True); self.tor_check.setChecked(False); self.tor_check.blockSignals(False)
             return
 
-        # no-op if state already matches (prevents spam)
         if checked == self.tor_active:
             return
 
@@ -419,17 +436,21 @@ class MainWindow(QWidget):
                 self.node.set_safety_mode(True, socks_uri)
                 self.tor_active = True
                 self.log.append(f"Safety mode: ON ({socks_uri})")
+                # NEW: try onion + persist (or persist plain URL with socks)
+                await self._bind_onion_if_available(socks_uri)
             except Exception as e:
                 self.log.append(f"Failed to start Tor: {e}")
-                self.tor_check.blockSignals(True)
-                self.tor_check.setChecked(False)
-                self.tor_check.blockSignals(False)
+                self.tor_check.blockSignals(True); self.tor_check.setChecked(False); self.tor_check.blockSignals(False)
         else:
             if self.tor_active:
                 self.node.set_safety_mode(False, None)
                 await self.tor.stop()
                 self.tor_active = False
-                self.log.append("Safety mode: OFF")
+                # NEW: persist Safety OFF
+                if self.node and self.node.server_url:
+                    self.node.persist_server_url(self.node.server_url, safety_mode=False, tor_socks=None)
+                self.log.append("Safety mode: OFF (saved)")
+
 
 # ───────────────────────── run ─────────────────────────
 

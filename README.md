@@ -1,6 +1,6 @@
 # MeshMsg (alpha) — Hybrid Mesh + Tor Messenger
 
-> A minimal, privacy‑first messenger that works on LAN mesh (no internet), and opportunistically syncs via a relay server — optionally over Tor.
+> A minimal, privacy-first messenger that works on LAN mesh (no internet), and opportunistically syncs via a relay server — optionally over Tor.
 
 ---
 
@@ -37,9 +37,9 @@
 
 ## Motivation
 
-- **Work offline / low‑connectivity.** On the same Wi‑Fi/LAN, nodes discover each other and exchange messages peer‑to‑peer — no internet needed.
+- **Work offline / low-connectivity.** On the same Wi-Fi/LAN, nodes discover each other and exchange messages peer-to-peer — no internet needed.
 - **Resilient delivery.** If peers aren’t reachable, messages are queued and later synced via a simple relay server.
-- **Privacy‑first.** Message bodies are end‑to‑end encrypted and signed. The relay never sees plaintext.
+- **Privacy-first.** Message bodies are end-to-end encrypted and signed. The relay never sees plaintext.
 - **Transport privacy.** When Safety is ON, server sync runs behind Tor (SOCKS). If the server exposes a `.onion`, the client can switch to it.
 
 ---
@@ -47,7 +47,7 @@
 ## Features
 
 - **LAN mesh messaging** with UDP multicast discovery and TCP gossip.
-- **Store‑and‑forward** using a tiny Flask relay (`/sync` + `/pull`).
+- **Store-and-forward** using a tiny Flask relay (`/sync` + `/pull`).
 - **E2E crypto**: X25519 sealed boxes + Ed25519 signatures.
 - **GUI** (PySide6 + qasync): usernames, people list, chat panes, Tor toggle.
 - **Optional Tor**: reuse system Tor or spawn a private Tor via `stem`.
@@ -60,37 +60,37 @@
 
 ```mermaid
 flowchart LR
-    subgraph LAN[Local Network]
-        A[Node A<br/>GUI + Node + Store] --- B[Node B<br/>GUI + Node + Store]
-        A --- C[Node C<br/>GUI + Node + Store]
-        B --- C
-    end
+  subgraph LAN[Local Network]
+    A[Node A\nGUI + Node + Store] --- B[Node B\nGUI + Node + Store]
+    A --- C[Node C\nGUI + Node + Store]
+    B --- C
+  end
 
-    subgraph Relay[Central Relay Server]
-        S[Flask Server<br/>(/sync, /pull, /ping, /onion)]
-    end
+  subgraph Relay[Central Relay Server]
+    S[Flask Relay\n/sync /pull /ping /onion]
+  end
 
-    A <-- gossip / TCP --> B
-    B <-- gossip / TCP --> C
-    A <-- gossip / TCP --> C
+  A <-- gossip / TCP --> B
+  B <-- gossip / TCP --> C
+  A <-- gossip / TCP --> C
 
-    A <-- optional HTTP(S)/Tor --> S
-    B <-- optional HTTP(S)/Tor --> S
-    C <-- optional HTTP(S)/Tor --> S
+  A <-- optional HTTP(S)/Tor --> S
+  B <-- optional HTTP(S)/Tor --> S
+  C <-- optional HTTP(S)/Tor --> S
 ```
 
 ### Components
 
 ```mermaid
 graph TD
-    GUI[gui_qt.py<br/>(PySide6 + qasync)] --> NodePy[node.py<br/>(mesh + sync + crypto)]
-    NodePy --> StorePy[store.py<br/>(SQLite: messages/peers/forwarded)]
-    NodePy --> Crypto[crypto_utils.py<br/>(X25519/Ed25519)]
-    NodePy --> Bootstrap[bootstrap.py<br/>(profile + settings.toml)]
-    NodePy -->|HTTP(S)/SOCKS| ServerPy[server.py<br/>(Flask relay)]
+  GUI[gui_qt.py\n(PySide6 + qasync)] --> NodePy[node.py\n(mesh + sync + crypto)]
+  NodePy --> StorePy[store.py\n(SQLite: messages/peers/forwarded)]
+  NodePy --> Crypto[crypto_utils.py\n(X25519/Ed25519)]
+  NodePy --> Bootstrap[bootstrap.py\n(profile + settings.toml)]
+  NodePy -->|HTTP(S)/SOCKS| ServerPy[server.py\n(Flask relay)]
 
-    ServerPy -->|SQLite| ServerDB[(server_store.sqlite)]
-    StorePy -->|SQLite| ClientDB[(store.sqlite)]
+  ServerPy -->|SQLite| ServerDB[(server_store.sqlite)]
+  StorePy -->|SQLite| ClientDB[(store.sqlite)]
 ```
 
 ### Message Flow
@@ -201,7 +201,7 @@ python gui_qt.py
 - Type a **username** (e.g., “Alice”), click **Register / Start**.
 - In the second terminal, run GUI again for “Bob”.
 
-You should see one another appear under **People (nearby)** within a few seconds (multicast discovery). Double‑click a name to open a chat pane, then send messages.
+You should see one another appear under **People (nearby)** within a few seconds (multicast discovery). Double-click a name to open a chat pane, then send messages.
 
 > **Tip (macOS):** If you use the macOS firewall, allow Python to receive incoming connections so UDP multicast/TCP gossip works.
 
@@ -350,19 +350,19 @@ The `payload` is a JSON blob containing **ciphertext** and metadata only. The se
 
 ## Roadmap
 
-- Remove temporary “admin mode” and enforce friend‑only ACLs by default.
+- Remove temporary “admin mode” and enforce friend-only ACLs by default.
 - QR onboarding (exchange keys via QR).
 - File/attachment support with chunking.
 - Receipts/acks and smarter retry.
 - Mobile builds (PySide/Kivy/native).
 - Opportunistic NAT traversal / WebRTC datachannels.
-- Automatic onion service provisioning and life‑cycle management.
+- Automatic onion service provisioning and life-cycle management.
 
 ---
 
 ## License
 
-TBD — pick your preferred open‑source license.
+TBD — pick your preferred open-source license.
 
 ---
 
@@ -371,4 +371,4 @@ TBD — pick your preferred open‑source license.
 - **PyNaCl** (libsodium/NaCl) for crypto primitives.
 - **PySide6 + qasync** for the async desktop UI.
 - **Stem** for Tor control and launching.
-- **Flask + Flask‑CORS** for the minimal relay server.
+- **Flask + Flask-CORS** for the minimal relay server.
